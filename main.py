@@ -11,6 +11,7 @@ import uvicorn
 from fastapi import FastAPI
 
 from api import router as router_api_router
+from api.agent_routes import agent_router as langgraph_agent_router
 
 app = FastAPI(
     title="AI 短视频辅助服务",
@@ -19,6 +20,7 @@ app = FastAPI(
 )
 
 app.include_router(router_api_router)
+app.include_router(langgraph_agent_router)
 
 
 @app.get("/health", summary="健康检查")
