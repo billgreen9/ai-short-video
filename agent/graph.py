@@ -1,11 +1,13 @@
 """LangGraph 智能体：路由 + 规划。
 
 图结构：
-    START --> agent --> plan --> END
+    START --> intent --> plan --> END
+
+    单独设计intent是为了以后的预留召回设计，防止路由膨胀，必须要借助于“关键词+语义”检索召回
 
 状态只保留 messages：
 - 启动时写入 [SystemMessage(outline), HumanMessage(user_input)]
-- agent：路由提示词仅用于本次 LLM 调用，不写入 messages；回复追加为 AIMessage
+- intent：路由提示词仅用于本次 LLM 调用，不写入 messages；回复追加为 AIMessage
 - plan：读取 messages 最后一条（路由结果）做规划，回复追加为 AIMessage
 """
 from __future__ import annotations
@@ -68,7 +70,7 @@ def build_initial_messages(
     """
     outline = load_outline_prompt()
     human_payload = {
-        "id": id or "",
+        "id": id or "0",
         "video_id": video_id or "",
         "text": user_input,
     }
