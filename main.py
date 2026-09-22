@@ -10,7 +10,7 @@ from __future__ import annotations
 import uvicorn
 from fastapi import FastAPI
 
-from router_module.api import router as router_api_router
+from api import router as router_api_router
 
 app = FastAPI(
     title="AI 短视频辅助服务",

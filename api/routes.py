@@ -1,10 +1,11 @@
 """FastAPI 路由：暴露 /route 接口供外部调用。"""
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 
-from .schemas import RouteRequest, RouteResponse
-from .selector import SkillRouter
+from intent.selector import SkillRouter
+
+from .schemas import RouteResponse
 
 router = APIRouter(prefix="/router", tags=["router"])
 
@@ -19,13 +20,20 @@ def get_router() -> SkillRouter:
     return _router_instance
 
 
-@router.post("/route", response_model=RouteResponse, summary="技能路由选择")
-def route(req: RouteRequest) -> RouteResponse:
-    """根据用户输入选择置信度最高的 2 个技能。
+@router.get("/route", response_model=RouteResponse, summary="技能路由选择")
+def route(
+    user_input: str = Query(
+        ..., description="用户原始输入文本", min_length=1
+    ),
+    num: int = Query(
+        2, description="返回的技能个数上限", ge=1, le=10
+    ),
+) -> RouteResponse:
+    """根据用户输入选择置信度最高的 num 个技能（默认 2 个）。
 
-    请求体示例：
-    ```json
-    {"user_input": "帮我把这段视频的字幕翻译成英文并生成中文配音"}
+    请求示例（参数走 query string）：
+    ```
+    GET /router/route?user_input=帮我把这段视频的字幕翻译成英文并生成中文配音&num=2
     ```
 
     响应示例：
@@ -40,7 +48,7 @@ def route(req: RouteRequest) -> RouteResponse:
     ```
     """
     try:
-        scores = get_router().select(req.user_input)
+        scores = get_router().select(user_input, num=num)
     except RuntimeError as e:
         # 配置错误（如缺少 API Key）
         raise HTTPException(status_code=500, detail=str(e))
@@ -50,4 +58,4 @@ def route(req: RouteRequest) -> RouteResponse:
             status_code=502, detail=f"路由选择失败: {e}"
         )
 
-    return RouteResponse(user_input=req.user_input, skills=scores)
+    return RouteResponse(user_input=user_input, skills=scores)

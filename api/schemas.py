@@ -1,22 +1,11 @@
-"""请求/响应数据模型。"""
+"""HTTP 响应数据模型。"""
 from __future__ import annotations
 
 from typing import List
 
 from pydantic import BaseModel, Field
 
-
-class RouteRequest(BaseModel):
-    """路由选择请求。"""
-
-    user_input: str = Field(..., description="用户原始输入文本")
-
-
-class SkillScore(BaseModel):
-    """单个技能的匹配结果。"""
-
-    skill: str = Field(..., description="技能标识符")
-    degree: float = Field(..., ge=0.0, le=1.0, description="置信度，0-1，越大越匹配")
+from intent.schemas import SkillScore
 
 
 class RouteResponse(BaseModel):

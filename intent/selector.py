@@ -7,7 +7,7 @@ from typing import List, Optional
 
 from openai import OpenAI
 
-from .config import settings
+from config import settings
 from .schemas import SkillScore
 
 # 技能定义：标识符 -> 中文描述。描述用于辅助 LLM 准确路由。
@@ -28,12 +28,12 @@ SYSTEM_PROMPT = """你是一个路由选择器，根据用户输入选择最合�
 用户输入：{user_input}
 
 返回结果：
-以 JSON 格式返回置信度最高的 2 个技能，严格遵循如下格式（不要附加任何文字、不要使用 markdown 代码块）：
+以 JSON 格式返回置信度最高的 {num} 个技能，严格遵循如下格式（不要附加任何文字、不要使用 markdown 代码块）：
 {{"results": [{{"skill": "audio", "degree": 1.0}}, {{"skill": "synthetical", "degree": 0.8}}]}}
 
 要求：
 1. degree 为置信度，取值 0-1，越大匹配度越高；
-2. 结果按 degree 从大到小排序，最多返回 2 个；
+2. 结果按 degree 从大到小排序，最多返回 {num} 个；
 3. skill 字段必须是上述列表中的英文标识符：audio / video / subtitle / short / synthetical；
 4. 仅输出 JSON 本身，不要包含解释或多余文本。
 """.strip()
@@ -44,11 +44,12 @@ def _build_skills_block() -> str:
     return "\n".join(f"- {name}: {desc}" for name, desc in SKILLS.items())
 
 
-def _parse_skills(raw: str) -> List[SkillScore]:
+def _parse_skills(raw: str, num: int = 2) -> List[SkillScore]:
     """从 LLM 输出中解析出技能列表。
 
     优先按 {"results": [...]} 解析；失败时尝试直接解析为列表；
     再失败时用正则提取首个 JSON 片段。最终做范围截断与去重。
+    返回最多 num 个结果。
     """
     text = raw.strip()
     # 去掉可能被模型误加的 markdown 代码块
@@ -93,9 +94,9 @@ def _parse_skills(raw: str) -> List[SkillScore]:
         seen.add(skill)
         scores.append(SkillScore(skill=skill, degree=float(degree)))
 
-    # 按 degree 降序，最多保留 2 个
+    # 按 degree 降序，最多保留 num 个
     scores.sort(key=lambda s: s.degree, reverse=True)
-    return scores[:2]
+    return scores[:num]
 
 
 class SkillRouter:
@@ -132,14 +133,17 @@ class SkillRouter:
             self._client = OpenAI(base_url=self.base_url, api_key=self.api_key)
         return self._client
 
-    def select(self, user_input: str) -> List[SkillScore]:
-        """根据用户输入返回置信度最高的 2 个技能。"""
+    def select(self, user_input: str, num: int = 2) -> List[SkillScore]:
+        """根据用户输入返回置信度最高的 num 个技能。"""
         if not user_input or not user_input.strip():
             return []
+        if num < 1:
+            num = 1
 
         prompt = SYSTEM_PROMPT.format(
             skills_block=_build_skills_block(),
             user_input=user_input,
+            num=num,
         )
 
         # 构造请求参数；关闭推理时通过 extra_body 传递厂商私有参数
@@ -157,4 +161,4 @@ class SkillRouter:
 
         completion = self.client.chat.completions.create(**kwargs)
         raw = completion.choices[0].message.content or ""
-        return _parse_skills(raw)
+        return _parse_skills(raw, num=num)
