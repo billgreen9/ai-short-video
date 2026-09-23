@@ -1,4 +1,6 @@
 {
   "num": 2,
-  "degree_threshold": 0.72
+  "degree_threshold": 0.72,
+  "plan_review_max": 10,
+  "plan_enter_max": 15
 }

@@ -95,38 +95,40 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
 `action` 取值：
 
-| action | 含义 |
-| --- | --- |
-| `user_input` | 需用户补充信息，`answer` 为指导话术 |
-| `instruction` | 需继续加载说明，`list` 为 domain 列表 |
+| action | 含义 | 图上行为 |
+| --- | --- | --- |
+| `user_input` | 需用户补充，`answner` 为指导话术 | 暂停（END） |
+| `param` | 缺少执行参数，`msg` 说明缺参 | 暂停（END） |
+| `instruction` | 继续加载说明，`list` 为 domain，`help` 默认 false | → `instruction` |
+| `plan` | 详细执行计划 `plans[{en_name,order}]` | 追加确认话术后自环 `plan` |
+| `can_execute` | 已拆成原子方法，可执行 | → `before_execute` → `execute` → END |
 
 ## LangGraph 流程
 
 ```text
 START
   → intent
-  → instruction ──(instruction_route)──→ plan
+  → instruction ──(instruction_route)──→ plan ←──(action=plan 自环)
        ↑                                  │
-       └──────── plan_route ──────────────┤
-                                          │（非继续加载说明）
-                                          v
-                                   before_execute → execute → END
+       └──── action=instruction ──────────┤
+                                          ├─ user_input / param → 暂停(END)
+                                          └─ can_execute → before_execute → execute → END
 ```
 
 ### 节点职责
 
 | 节点 | 职责 |
 | --- | --- |
-| `intent` | 调用 LLM 做意图路由；写入 `intents`、`domains`（`degree > degree_threshold`）；`prev_node=intent` |
-| `instruction` | 只读 `domains` 查表；将说明以 `HumanMessage(input_type=agent)` 写入 `messages`；**不改** `prev_node` |
-| `plan` | 首次用 `PLAN_PROMPT_TEMPLATE` 请求；之后用「请继续尝试规划」；写入 `action`；若需继续加载则更新 `domains` |
-| `before_execute` | 执行前处理（当前为占位） |
-| `execute` | 执行（当前为占位） |
+| `intent` | 意图路由；写入 `intents`、`domains`；`prev_node=intent` |
+| `instruction` | 按 `domains` 查表，说明写入 `HumanMessage(input_type=agent)`；不改 `prev_node` |
+| `plan` | `prev_node==plan` 时直接基于 messages 请求 LLM；否则首次用 `PLAN_PROMPT_TEMPLATE`；按返回 action 分支 |
+| `before_execute` | 执行前校验 / 收集参数（占位） |
+| `execute` | 执行（占位） |
 
 ### 路由规则
 
-- **instruction_route**：`prev_node == intent` → `plan`；否则 → `prev_node`（一般为 `plan`）
-- **plan_route**：`action.action == instruction` 且 `instructions`、`domains` 非空 → 回流 `instruction`；否则 → `before_execute` → `execute` → `END`
+- **instruction_route**：`prev_node == intent` → `plan`；否则 → `prev_node`
+- **plan_route**：见上表「图上行为」
 
 ### GraphState
 

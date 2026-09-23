@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 # config.json 位于项目根目录（agent/ 的上一级）
 CONFIG_PATH = Path(__file__).parent.parent / "config.json"
@@ -18,10 +18,17 @@ CONFIG_PATH = Path(__file__).parent.parent / "config.json"
 class AgentConfig(BaseModel):
     """智能体业务配置。"""
 
-    # 路由返回的意图个数上限
+    # 路由返回的技能个数上限
     num: int = 2
-    # 进入规划节点前，意图置信度必须严格大于该阈值
-    degree_threshold: float = Field(default=0.72, ge=0.0, le=1.0)
+
+    # 意图置信度阈值：degree 大于该值的意图才会作为 domain 加载说明
+    degree_threshold: float = 0.72
+
+    # plan 自环（action=plan 原子化自检）次数上限：超过后暂停（返回 user_input 指导话术）
+    plan_review_max: int = 10
+
+    # plan 节点总执行次数上限（含 instruction/param 等回流）：超过后强制结束
+    plan_enter_max: int = 15
 
 
 def load_config() -> AgentConfig:

@@ -21,8 +21,8 @@ class Settings(BaseSettings):
     # 是否关闭推理模型的思考过程 (Ark doubao-seed 等推理模型在路由分类场景下建议关闭以大幅降低延迟)
     OPENAI_DISABLE_THINKING: bool = True
 
-    # Postgres：instruction 等业务表所在库（默认 short-video）
-    POSTGRES_DSN: str = "postgresql://localhost:5432/short-video"
+    # PostgreSQL：instruction 表（系统提示词与各 domain 操作说明）
+    POSTGRES_DSN: str = ""
 
 
 settings = Settings()

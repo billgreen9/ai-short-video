@@ -3,30 +3,29 @@
 主路径：
     START --> intent --> instruction --(+ instruction_route)--> plan
                               ^                                  |
+                              |                                  +--(+ plan 自环)
                               |                                  |
-                              +---- plan_route (需继续加载说明)
-                                                                     |
-                                                                     v
-                                                          before_execute --> execute --> END
+                              +---- plan_route (instruction)     |
+                                                                 v
+                                              user_input/param → 暂停(END)
+                                              can_execute → before_execute → execute → END
+
+plan 节点：
+    - 首次进入（plan_prompt_used=False）：向全量 messages 末尾注入一次
+      PLAN_PROMPT_TEMPLATE（5 种 action 协议），再请求 LLM；操作说明已在 messages 中，不重复携带
+    - 回流（plan 自环 / instruction / param 等）：直接基于当前全量 messages 请求 LLM
+    - 按返回 action 分支（见 plan_route）
+
+循环次数限制（阈值在 config.json）：
+    - plan_enter_count：plan 节点每次执行都 +1；instruction/param 等回流也计入；
+      超过 plan_enter_max(15) 强制结束（action=end）
+    - plan_review_count：仅当因 action=plan 自环（原子化自检）回流时 +1；
+      因 instruction/param/user_input 造成的回流不计；
+      超过 plan_review_max(10) 暂停（action=user_input 指导话术）
 
 instruction_route：
     - prev_node == "intent" -> plan
     - 其他 -> prev_node（通常为 plan）
-
-plan_route：
-    - action.action == "instruction" 且 instructions/domains 非空 -> instruction
-    - 其余 -> before_execute
-
-各节点职责：
-    - intent：写入 intents / domains，prev_node=intent
-    - instruction：只按 domains 加载说明到 HumanMessage(input_type=agent)；不改 prev_node
-    - plan：首次用 PLAN_PROMPT_TEMPLATE 请求；之后用「请继续尝试规划」；
-      写入 action；action=instruction 时更新 domains 并回流 instruction
-    - before_execute：执行前处理（占位）
-    - execute：执行（占位）
-
-启动 messages：
-    [SystemMessage(outline), HumanMessage(用户正文, additional_kwargs={id})]
 """
 from __future__ import annotations
 
@@ -43,6 +42,7 @@ from agent.config import agent_config
 from agent.instruction_store import fetch_instructions, load_outline_prompt
 from agent.parse import message_text, parse_plan, parse_route_intents
 from agent.prompts import (
+    PLAN_ATOMIC_CONFIRM_PROMPT,
     PLAN_PROMPT_TEMPLATE,
     ROUTE_PROMPT_TEMPLATE,
     build_instruction_blocks,
@@ -53,7 +53,6 @@ from config import settings
 
 
 _llm: Optional[ChatOpenAI] = None
-_CONTINUE_PLAN_PROMPT = "请继续尝试规划"
 
 
 def _get_llm() -> ChatOpenAI:
@@ -91,6 +90,10 @@ class GraphState(TypedDict):
     # 是否已用 PLAN_PROMPT_TEMPLATE 请求过规划
     plan_prompt_used: bool
 
+    # plan 节点执行计数（循环保护）
+    plan_enter_count: int    # plan 节点总执行次数（含 instruction/param 等回流）
+    plan_review_count: int   # 仅 action=plan 原子化自检自环的次数
+
 
 def build_initial_messages(
     user_input: str,
@@ -122,6 +125,8 @@ def build_initial_state(
         "action": {},
         "prev_node": "",
         "plan_prompt_used": False,
+        "plan_enter_count": 0,
+        "plan_review_count": 0,
     }
 
 
@@ -231,28 +236,22 @@ def instruction_route(state: GraphState) -> str:
     return "plan"
 
 
-def _latest_agent_human_message(
-    messages: list[BaseMessage],
-) -> HumanMessage | None:
-    """取最近一条 input_type=agent 的用户消息。"""
-    for msg in reversed(messages):
-        if isinstance(msg, HumanMessage) and _message_fields(msg)["input_type"] == "agent":
-            return msg
-    return None
+def _plan_node_impl(state: GraphState) -> dict:
+    """规划节点主体（不含循环计数，计数由 plan_node 包装器统一写入）。
 
-
-def plan_node(state: GraphState) -> dict:
-    """规划节点：首次用 PLAN_PROMPT_TEMPLATE，之后用「请继续尝试规划」。"""
+    - 首次进入（plan_prompt_used=False）：向全量 messages 末尾注入一次
+      PLAN_PROMPT_TEMPLATE（action 协议），再请求 LLM；操作说明已在 messages 中，不重复携带
+    - 回流：直接基于当前全量 messages 请求 LLM
+    - 按 LLM 返回的 action 写状态，由 plan_route 跳转或暂停
+    """
     messages = list(state.get("messages") or [])
-    domains = list(state.get("domains") or [])
-    rows = list(state.get("instructions") or [])
     user_input = _user_input_from_messages(messages)
-    plan_prompt_used = bool(state.get("plan_prompt_used"))
+    fw_id = _framework_id_from_messages(messages)
 
     if not user_input or not messages:
         plan = {
             "action": "user_input",
-            "answer": "用户输入信息不全，无法进行规划，请补充",
+            "answner": "用户输入信息不全，无法进行规划，请补充",
         }
         return {
             "messages": [AIMessage(content=_dump_plan(plan))],
@@ -260,49 +259,24 @@ def plan_node(state: GraphState) -> dict:
             "prev_node": "plan",
         }
 
-    if not domains:
-        plan = {
-            "action": "user_input",
-            "answer": "未匹配到足够置信度的操作，请补充更具体的需求",
-        }
-        return {
-            "messages": [AIMessage(content=_dump_plan(plan))],
-            "action": plan,
-            "prev_node": "plan",
-        }
+    llm_messages: list[BaseMessage]
+    extra_messages: list[BaseMessage] = []
 
-    if not rows:
-        plan = {"action": "instruction", "list": domains}
-        return {
-            "messages": [AIMessage(content=_dump_plan(plan))],
-            "action": plan,
-            "prev_node": "plan",
-        }
-
-    if not plan_prompt_used:
-        request_text = PLAN_PROMPT_TEMPLATE.format(
-            user_input=user_input,
-            instruction_blocks=build_instruction_blocks(rows),
-            domain_hints=build_instruction_domain_hints(),
-        )
+    if state.get("plan_prompt_used"):
+        # 回流（plan 自环 / instruction / param 等）：直接用当前全量对话请求 LLM
+        llm_messages = list(messages)
     else:
-        request_text = _CONTINUE_PLAN_PROMPT
-
-    request_msg = _build_user_input_message(
-        request_text,
-        id=_framework_id_from_messages(messages),
-        input_type="agent",
-    )
-
-    llm_messages: list[BaseMessage] = []
-    if isinstance(messages[0], SystemMessage):
-        llm_messages.append(SystemMessage(content=message_text(messages[0])))
-    # 继续规划时带上最近一次 instruction 加载的说明消息
-    if plan_prompt_used:
-        loaded = _latest_agent_human_message(messages)
-        if loaded is not None:
-            llm_messages.append(loaded)
-    llm_messages.append(request_msg)
+        # 首次进入：注入一次 action 协议提示词。
+        # 用户请求与操作说明已在 messages 中，这里不再重复携带，避免同一份说明发两遍。
+        request_msg = _build_user_input_message(
+            PLAN_PROMPT_TEMPLATE.format(
+                domain_hints=build_instruction_domain_hints(),
+            ),
+            id=fw_id,
+            input_type="agent",
+        )
+        extra_messages = [request_msg]
+        llm_messages = list(messages) + [request_msg]
 
     response = _get_llm().invoke(llm_messages)
     # todo 后续这种结果返回尽量使用 with_structured_output 方式。
@@ -312,15 +286,15 @@ def plan_node(state: GraphState) -> dict:
     except ValueError:
         plan = {
             "action": "user_input",
-            "answer": "规划结果无法解析，请补充更具体的需求",
+            "answner": "规划结果无法解析，请补充更具体的需求",
         }
         return {
-            "messages": [
-                request_msg,
+            "messages": extra_messages
+            + [
                 AIMessage(content=raw),
                 _build_user_input_message(
-                    plan["answer"],
-                    id=_framework_id_from_messages(messages),
+                    plan["answner"],
+                    id=fw_id,
                     input_type="agent",
                 ),
             ],
@@ -329,31 +303,135 @@ def plan_node(state: GraphState) -> dict:
             "plan_prompt_used": True,
         }
 
-    updates: dict[str, Any] = {
-        "messages": [request_msg, AIMessage(content=raw)],
+    ai_msg = AIMessage(content=raw)
+    kind = plan.get("action")
+
+    # 1/2 暂停：写入 action，由 plan_route 结束
+    if kind in ("user_input", "param"):
+        return {
+            "messages": extra_messages + [ai_msg],
+            "action": plan,
+            "prev_node": "plan",
+            "plan_prompt_used": True,
+        }
+
+    # 3 加载说明：消息入列，list → domains，进 instruction
+    if kind == "instruction":
+        domains_next = [str(x) for x in (plan.get("list") or []) if str(x)]
+        return {
+            "messages": extra_messages + [ai_msg],
+            "action": plan,
+            "domains": domains_next,
+            "prev_node": "plan",
+            "plan_prompt_used": True,
+        }
+
+    # 4 详细 plan：消息入列，再追加原子/无环确认话术，自环回 plan
+    if kind == "plan":
+        confirm_msg = _build_user_input_message(
+            PLAN_ATOMIC_CONFIRM_PROMPT,
+            id=fw_id,
+            input_type="agent",
+        )
+        return {
+            "messages": extra_messages + [ai_msg, confirm_msg],
+            "action": plan,
+            "prev_node": "plan",
+            "plan_prompt_used": True,
+        }
+
+    # 5 can_execute：进 before_execute
+    return {
+        "messages": extra_messages + [ai_msg],
         "action": plan,
         "prev_node": "plan",
         "plan_prompt_used": True,
     }
-    if plan.get("action") == "instruction":
-        updates["domains"] = [str(x) for x in (plan.get("list") or []) if str(x)]
-    return updates
+
+
+def plan_node(state: GraphState) -> dict:
+    """规划节点包装器：统一做循环计数与超限保护，再执行主体逻辑。
+
+    - plan_enter_count：每次进入 plan 都 +1（instruction/param 等回流也计入），
+      超过 plan_enter_max 强制结束（action=end）
+    - plan_review_count：仅因上一轮 action=plan 自环回流时 +1，
+      超过 plan_review_max 暂停（action=user_input 指导话术）
+    """
+    prev_action = (state.get("action") or {}).get("action")
+    enter_total = int(state.get("plan_enter_count") or 0) + 1
+    review_total = int(state.get("plan_review_count") or 0) + (
+        1 if prev_action == "plan" else 0
+    )
+
+    counters = {
+        "plan_enter_count": enter_total,
+        "plan_review_count": review_total,
+    }
+
+    # 总执行次数超限：强制结束（优先于暂停判定）
+    if enter_total > agent_config.plan_enter_max:
+        plan = {
+            "action": "end",
+            "msg": f"plan 节点执行次数已超过上限 {agent_config.plan_enter_max} 次，强制结束",
+        }
+        return {
+            "messages": [AIMessage(content=_dump_plan(plan))],
+            "action": plan,
+            "prev_node": "plan",
+            "plan_prompt_used": True,
+            **counters,
+        }
+
+    # 原子化自检自环超限：暂停，给出指导话术（由 plan_route 结束，等待用户补充后重新发起）
+    if review_total > agent_config.plan_review_max:
+        plan = {
+            "action": "user_input",
+            "answner": (
+                f"规划自检已达 {agent_config.plan_review_max} 轮，"
+                "请确认计划是否已全部拆分为无环的原子方法，或补充必要信息后重新发起"
+            ),
+        }
+        return {
+            "messages": [AIMessage(content=_dump_plan(plan))],
+            "action": plan,
+            "prev_node": "plan",
+            "plan_prompt_used": True,
+            **counters,
+        }
+
+    result = _plan_node_impl(state)
+    result.update(counters)
+    return result
 
 
 def plan_route(state: GraphState) -> str:
-    """需继续加载说明时回流 instruction，否则进入 before_execute。"""
+    """按 action 跳转：暂停 / instruction / plan 自环 / before_execute / 强制结束。"""
     action = state.get("action") or {}
-    if (
-        action.get("action") == "instruction"
-        and (state.get("instructions") or [])
-        and (state.get("domains") or [])
-    ):
-        return "instruction"
-    return "before_execute"
+    kind = action.get("action")
+
+    if kind in ("user_input", "param"):
+        return END
+
+    # 循环保护强制结束（仅由 plan_node 计数守卫产生，LLM 不会返回该 action）
+    if kind == "end":
+        return END
+
+    if kind == "instruction":
+        if state.get("domains"):
+            return "instruction"
+        return END
+
+    if kind == "plan":
+        return "plan"
+
+    if kind == "can_execute":
+        return "before_execute"
+
+    return END
 
 
 def before_execute_node(state: GraphState) -> dict:
-    """执行前处理（占位，后续可挂校验 / 参数准备等）。"""
+    """执行前处理：校验 / 收集参数（占位）。"""
     return {"prev_node": "before_execute"}
 
 
@@ -384,7 +462,9 @@ def build_graph():
         plan_route,
         {
             "instruction": "instruction",
+            "plan": "plan",
             "before_execute": "before_execute",
+            END: END,
         },
     )
     graph.add_edge("before_execute", "execute")

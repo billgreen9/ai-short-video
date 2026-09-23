@@ -10,15 +10,15 @@ from __future__ import annotations
 import uvicorn
 from fastapi import FastAPI
 
-from api.agent_routes import agent_router
+from api import agent_router as langgraph_agent_router
 
 app = FastAPI(
     title="AI 短视频辅助服务",
-    description="根据用户输入路由到合适的意图（audio/video/subtitle/short/synthetical）",
+    description="基于 LangGraph 的短视频辅助智能体：意图路由 → 说明加载 → 规划 → 执行",
     version="0.1.0",
 )
 
-app.include_router(agent_router)
+app.include_router(langgraph_agent_router)
 
 
 @app.get("/health", summary="健康检查")

@@ -5,7 +5,7 @@ import json
 import re
 from typing import Any
 
-_PLAN_ACTIONS = {"user_input", "instruction"}
+_PLAN_ACTIONS = {"user_input", "param", "instruction", "plan", "can_execute"}
 
 # instruction.list 当前支持的 domain
 INSTRUCTION_DOMAINS = {
@@ -80,6 +80,21 @@ def parse_route_intents(content: str) -> list[dict[str, Any]]:
     return intents
 
 
+def _parse_plans(raw: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+    plans: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict) or "en_name" not in item:
+            continue
+        try:
+            order = int(item.get("order", 0))
+        except (TypeError, ValueError):
+            order = 0
+        plans.append({"en_name": str(item["en_name"]), "order": order})
+    return plans
+
+
 def parse_plan(content: str) -> dict[str, Any]:
     """解析规划节点的 action JSON。"""
     parsed = _load_json(content)
@@ -91,14 +106,35 @@ def parse_plan(content: str) -> dict[str, Any]:
         raise ValueError(f"未知的规划动作: {action!r}")
 
     if action == "user_input":
-        answer = parsed.get("answer", "")
+        answer = parsed.get("answner", parsed.get("answer", ""))
         return {
             "action": "user_input",
-            "answer": "" if answer is None else str(answer),
+            "answner": "" if answer is None else str(answer),
         }
 
-    raw_list = parsed.get("list") or []
-    if not isinstance(raw_list, list):
-        raw_list = []
-    domains = [str(item).strip() for item in raw_list if str(item).strip()]
-    return {"action": "instruction", "list": domains}
+    if action == "param":
+        msg = parsed.get("msg", "")
+        return {"action": "param", "msg": "" if msg is None else str(msg)}
+
+    if action == "instruction":
+        raw_list = parsed.get("list") or []
+        if not isinstance(raw_list, list):
+            raw_list = []
+        domains = [str(item).strip() for item in raw_list if str(item).strip()]
+        help_flag = parsed.get("help", False)
+        return {
+            "action": "instruction",
+            "list": domains,
+            "help": bool(help_flag),
+        }
+
+    if action == "plan":
+        return {"action": "plan", "plans": _parse_plans(parsed.get("plans"))}
+
+    # can_execute
+    msg = parsed.get("msg", "")
+    return {
+        "action": "can_execute",
+        "msg": "" if msg is None else str(msg),
+        "plans": _parse_plans(parsed.get("plans")),
+    }

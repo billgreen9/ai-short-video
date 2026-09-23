@@ -81,27 +81,39 @@ ROUTE_PROMPT_TEMPLATE = """
 """.strip()
 
 
-# 规划节点提示词：基于命中的 instruction 说明，决定下一步动作。
-PLAN_PROMPT_TEMPLATE = """用户请求：
-{user_input}
+# 规划节点提示词：仅声明下一步动作的 JSON 协议。
+# 注意：用户请求与命中的操作说明（instruction blocks）已在 messages 中：
+#   - 用户请求：首条 HumanMessage
+#   - 操作说明：instruction 节点追加的 HumanMessage(input_type=agent)
+# 本提示词由 plan 节点首次进入时注入一次，不重复携带说明正文。
+PLAN_PROMPT_TEMPLATE = """请根据对话中已给出的用户请求与操作说明，进行下一步规划。
+注意：返回必须以定义的 json 格式返回，不要附加任何文字、不要使用 markdown 代码块。
 
-你现在匹配到了以下可能的操作，请根据以下可能的操作说明进行下一步规划：
-{instruction_blocks}
+1. 当前处理用户请求尚且不清晰，需要用户补充信息，并给出指导话术：
+{{"action":"user_input","answner":"指导话术"}}
 
-请根据以上操作说明，进行以下可能的操作(注意：返回必须以定义的 json 格式返回，不要附加任何文字、不要使用 markdown 代码块)：
+2. 当前用户请求清晰，但是执行缺少参数，比如视频 id、分镜 id 等：
+{{"action":"param","msg":"缺少参数"}}
 
-1. 当前处理用户请求尚且不清晰，需要用户补充信息，并给出指导话术（发给请求方的）：
-{{"action":"user_input","answer":"用户输入信息不全，无法进行规划，请补充"}}
+3. 对如何完成用户请求尚且不明白，还缺少必要说明：
+{{"action":"instruction","list":["subtitle","short"],"help":false}}
 
-2. 对如何完成用户请求尚且不明白，还缺少必要说明；端上根据 list 继续加载说明：
-{{"action":"instruction","list":["subtitle","short"]}}
+4. 输出给后端详细的 plan 计划，按执行先后返回；order 越小越先执行，order 相同可并发：
+{{"action":"plan","plans":[{{"en_name":"xx","order":1}}]}}
+
+5. 已经将规划上的所有方法变更为原子方法，可以执行：
+{{"action":"can_execute","msg":"所有方法已经是原子方法了，可以执行了","plans":[{{"en_name":"xx","order":1}}]}}
 
 instruction.list 当前支持的值：
 {domain_hints}
 
 要求：
-1. action 只能是 user_input 或 instruction；
-2. action=user_input 时必须提供 answer；
-3. action=instruction 时 list 只能从上述支持的值中选择；
-4. 仅输出 JSON 本身。
+1. action 只能是 user_input / param / instruction / plan / can_execute；
+2. 仅输出 JSON 本身。
 """.strip()
+
+# plan 自检回流时追加的确认话术
+PLAN_ATOMIC_CONFIRM_PROMPT = (
+    "请确认是否每个节点都是function节点，是否存在环，"
+    "如果不是请拆分为原子节点，然后确认无环时返回。"
+)

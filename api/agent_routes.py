@@ -20,8 +20,12 @@ class AgentRouteResponse(BaseModel):
 
     action: Optional[dict[str, Any]] = Field(
         default=None,
-        description='动作结果，如 {"action":"user_input","answer":"..."} '
-        '或 {"action":"instruction","list":["subtitle"]}',
+        description='动作结果，如 {"action":"user_input","answner":"..."} / '
+        '{"action":"param","msg":"..."} / '
+        '{"action":"instruction","list":["subtitle"],"help":false} / '
+        '{"action":"plan","plans":[...]} / '
+        '{"action":"can_execute","plans":[...]} / '
+        '{"action":"end","msg":"..."}（end 仅由循环次数守卫产生，LLM 不会返回）',
     )
 
 
