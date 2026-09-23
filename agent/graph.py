@@ -1,14 +1,14 @@
 """LangGraph 智能体：意图路由 + 说明加载 + 规划 + 执行前/执行。
 
 主路径：
-    START --> intent --> instruction --(+ instruction_route)--> plan
-                              ^                                  |
-                              |                                  +--(+ plan 自环)
-                              |                                  |
-                              +---- plan_route (instruction)     |
-                                                                 v
-                                              user_input/param → 暂停(END)
-                                              can_execute → before_execute → execute → END
+    START --> intent --> instruction --(instruction_route)--> plan ←──(action=plan 自环)
+                              ^                               │
+                              │                               ├─ user_input/param → human_input
+                              │                               │     （interrupt 挂起，等待 /agent/resume）
+                              │                               │     resume 后用户补充入 messages ──▶ plan
+                              └── plan_route (instruction) ◀──┘
+                                                              └─ can_execute → before_execute → execute → END
+                                                              └─ end（循环次数超限）→ END
 
 plan 节点：
     - 首次进入（plan_prompt_used=False）：向全量 messages 末尾注入一次
@@ -36,8 +36,10 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
+from langgraph.types import interrupt
 from typing_extensions import TypedDict
 
+from agent.checkpoint import get_checkpointer
 from agent.config import agent_config
 from agent.instruction_store import fetch_instructions, load_outline_prompt
 from agent.parse import message_text, parse_plan, parse_route_intents
@@ -404,13 +406,49 @@ def plan_node(state: GraphState) -> dict:
     return result
 
 
+def human_input_node(state: GraphState) -> dict:
+    """人工输入节点：在用户补充信息 / 补充参数时通过 interrupt() 真正挂起图。
+
+    挂起载荷：
+        - action=user_input -> {"type":"user_input","answer":"指导话术"}
+        - action=param      -> {"type":"param","msg":"缺少参数"}
+    HTTP 层通过 /agent/resume 以 Command(resume=用户补充) 恢复；
+    恢复后 interrupt() 返回用户补充文本，本节点把它作为新 HumanMessage
+    写入 messages 并回到 plan 继续规划。
+
+    注意：interrupt 放在独立节点（而非 plan 节点内），恢复时只重放本节点，
+    不会重复触发 plan 的 LLM 调用。
+    """
+    action = state.get("action") or {}
+    kind = action.get("action")
+    if kind == "param":
+        payload = {"type": "param", "msg": action.get("msg", "")}
+    else:
+        payload = {"type": "user_input", "answer": action.get("answner", "")}
+
+    # 首次执行：在此挂起；恢复执行：返回 /agent/resume 传入的补充内容
+    user_reply = interrupt(payload)
+
+    if isinstance(user_reply, str):
+        reply_text = user_reply.strip()
+    else:
+        reply_text = str(user_reply or "").strip()
+
+    fw_id = _framework_id_from_messages(state.get("messages") or [])
+    return {
+        "messages": [_build_user_input_message(reply_text, id=fw_id)],
+        "prev_node": "plan",
+    }
+
+
 def plan_route(state: GraphState) -> str:
-    """按 action 跳转：暂停 / instruction / plan 自环 / before_execute / 强制结束。"""
+    """按 action 跳转：挂起等待输入 / instruction / plan 自环 / before_execute / 强制结束。"""
     action = state.get("action") or {}
     kind = action.get("action")
 
+    # 挂起（interrupt）：进入 human_input 节点等待用户补充，resume 后回 plan
     if kind in ("user_input", "param"):
-        return END
+        return "human_input"
 
     # 循环保护强制结束（仅由 plan_node 计数守卫产生，LLM 不会返回该 action）
     if kind == "end":
@@ -441,11 +479,12 @@ def execute_node(state: GraphState) -> dict:
 
 
 def build_graph():
-    """构造并编译智能体图。"""
+    """构造并编译智能体图（挂 PostgresSaver 检查点，支持 interrupt 挂起/恢复）。"""
     graph = StateGraph(GraphState)
     graph.add_node("intent", intent_node)
     graph.add_node("instruction", instruction_node)
     graph.add_node("plan", plan_node)
+    graph.add_node("human_input", human_input_node)
     graph.add_node("before_execute", before_execute_node)
     graph.add_node("execute", execute_node)
     graph.add_edge(START, "intent")
@@ -463,13 +502,16 @@ def build_graph():
         {
             "instruction": "instruction",
             "plan": "plan",
+            "human_input": "human_input",
             "before_execute": "before_execute",
             END: END,
         },
     )
+    # 用户补充信息后回到 plan 继续规划
+    graph.add_edge("human_input", "plan")
     graph.add_edge("before_execute", "execute")
     graph.add_edge("execute", END)
-    return graph.compile()
+    return graph.compile(checkpointer=get_checkpointer())
 
 
 compiled_graph = build_graph()

@@ -62,6 +62,9 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
 ## HTTP 接口
 
+会话按 `thread_id` 持久化到 PostgreSQL（LangGraph PostgresSaver，服务重启不丢）。
+所有接口均为 GET。
+
 ### `GET /agent/start`
 
 启动一轮：`intent → instruction → plan`。
@@ -69,39 +72,54 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 | 参数 | 说明 |
 | --- | --- |
 | `user_input` | 用户输入（必填） |
-| `id` | 框架元信息 id（可选，默认可空） |
+| `id` | 会话/框架 id（可选；为空时服务端生成 UUID，并在响应 `thread_id` 中返回） |
 
-响应：
+当 plan 判定需要用户补充信息 / 参数时，图在 `human_input` 节点通过 interrupt **真正挂起**，
+响应 `status=paused`：
 
 ```json
 {
-  "action": {
-    "action": "user_input",
-    "answer": "用户输入信息不全，无法进行规划，请补充"
-  }
+  "thread_id": "e2e-001",
+  "status": "paused",
+  "interrupt": {"type": "param", "msg": "缺少待剪辑音频的audio_id参数，请提供对应的音频id"},
+  "action": null
 }
 ```
 
-或：
+图走到终点（can_execute / 强制 end 等）时 `status=done`：
 
 ```json
 {
-  "action": {
-    "action": "instruction",
-    "list": ["subtitle", "short"]
-  }
+  "thread_id": "e2e-001",
+  "status": "done",
+  "interrupt": null,
+  "action": {"action": "can_execute", "msg": "...", "plans": [{"en_name": "auto_generate_subtitle", "order": 1}]}
 }
+```
+
+### `GET /agent/resume`
+
+对处于 `paused` 的会话提交用户补充，图从挂起点继续（可能再次暂停或走到 done）。
+
+| 参数 | 说明 |
+| --- | --- |
+| `thread_id` | start 响应中返回的会话 ID（必填） |
+| `user_input` | 用户补充的信息 / 参数（必填） |
+
+```
+GET /agent/resume?thread_id=e2e-001&user_input=audio_id=10086，去掉开头5秒
 ```
 
 `action` 取值：
 
 | action | 含义 | 图上行为 |
 | --- | --- | --- |
-| `user_input` | 需用户补充，`answner` 为指导话术 | 暂停（END） |
-| `param` | 缺少执行参数，`msg` 说明缺参 | 暂停（END） |
+| `user_input` | 需用户补充，`answner` 为指导话术 | → `human_input` 挂起，resume 后回 `plan` |
+| `param` | 缺少执行参数，`msg` 说明缺参 | → `human_input` 挂起，resume 后回 `plan` |
 | `instruction` | 继续加载说明，`list` 为 domain，`help` 默认 false | → `instruction` |
 | `plan` | 详细执行计划 `plans[{en_name,order}]` | 追加确认话术后自环 `plan` |
 | `can_execute` | 已拆成原子方法，可执行 | → `before_execute` → `execute` → END |
+| `end` | 循环次数超 `plan_enter_max` 的强制结束（仅守卫产生，LLM 不返回） | END |
 
 ## LangGraph 流程
 
@@ -111,7 +129,11 @@ START
   → instruction ──(instruction_route)──→ plan ←──(action=plan 自环)
        ↑                                  │
        └──── action=instruction ──────────┤
-                                          ├─ user_input / param → 暂停(END)
+                                          ├─ user_input / param → human_input（interrupt 挂起）
+                                          │                         │  GET /agent/resume
+                                          │                         ▼
+                                          │                       plan（用户补充入 messages）
+                                          ├─ end（循环超限）→ END
                                           └─ can_execute → before_execute → execute → END
 ```
 
@@ -121,7 +143,8 @@ START
 | --- | --- |
 | `intent` | 意图路由；写入 `intents`、`domains`；`prev_node=intent` |
 | `instruction` | 按 `domains` 查表，说明写入 `HumanMessage(input_type=agent)`；不改 `prev_node` |
-| `plan` | `prev_node==plan` 时直接基于 messages 请求 LLM；否则首次用 `PLAN_PROMPT_TEMPLATE`；按返回 action 分支 |
+| `plan` | 首次进入向全量 messages 末尾注入一次 `PLAN_PROMPT_TEMPLATE`（仅 action 协议，操作说明不重复携带）；回流直接基于全量 messages 请求 LLM；入口做循环计数与超限保护；按返回 action 分支 |
+| `human_input` | 调 `interrupt()` 挂起并下发指导话术/缺参载荷；resume 后把用户补充作为新 HumanMessage 写入 messages，回 `plan`。interrupt 独立成节点，恢复时只重放本节点，不重复触发 plan 的 LLM 调用 |
 | `before_execute` | 执行前校验 / 收集参数（占位） |
 | `execute` | 执行（占位） |
 
@@ -159,13 +182,14 @@ START
 ├── config.json             # 业务参数
 ├── requirements.txt
 ├── agent/
-│   ├── graph.py            # LangGraph 图与节点
+│   ├── graph.py            # LangGraph 图与节点（含 human_input 中断节点）
 │   ├── prompts.py          # 路由 / 规划提示词
 │   ├── parse.py            # 结果解析
 │   ├── instruction_store.py# instruction 表访问
+│   ├── checkpoint.py       # PostgresSaver 检查点（interrupt 挂起/恢复的会话持久化）
 │   └── config.py           # 加载 config.json
 ├── api/
-│   └── agent_routes.py     # /agent/start
+│   └── agent_routes.py     # /agent/start、/agent/resume
 ├── sql/
 │   └── instruction.sql     # 表结构
 └── intent/                 # 早期独立路由模块（遗留，当前 HTTP 未使用）
