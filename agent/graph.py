@@ -10,7 +10,8 @@
 
     单独设计 intent 是为了以后的预留召回设计，防止路由膨胀，必须要借助于“关键词+语义”检索召回
 
-intent 与 plan（action=instruction）均可进入 instruction。
+- instruction：按 domains 查表，把规划说明以 HumanMessage(input_type=agent) 写入 messages
+- plan：读取该 HumanMessage 请求 LLM，回复追加为 AIMessage
 """
 from __future__ import annotations
 
@@ -70,6 +71,7 @@ class GraphState(TypedDict):
 
     # plan 节点
     plan: dict[str, Any]  # {"action":"user_input","answer":"..."} 或 {"action":"instruction","list":[...]}
+    prev_node: str
 
 
 def build_initial_messages(
@@ -128,6 +130,7 @@ def intent_node(state: GraphState) -> dict:
         "messages": [response],
         "intents": intents,
         "domains": domains,
+        "pre_node":"intent"
     }
 
 
@@ -176,7 +179,7 @@ def _dump_plan(plan: dict[str, Any]) -> str:
 
 
 def instruction_node(state: GraphState) -> dict:
-    """按 state.domains 查 instruction，写入 instructions，再进入 plan。"""
+    """按 state.domains 查 instruction，写入状态，并以 HumanMessage(input_type=agent) 追加到 messages。"""
     messages = list(state.get("messages") or [])
     user_input = _user_input_from_messages(messages)
     if not user_input:
@@ -187,14 +190,42 @@ def instruction_node(state: GraphState) -> dict:
         return {"instructions": []}
 
     rows = fetch_instructions(domains)
+    if not rows:
+        return {
+            "instructions": [],
+            "domains": domains,
+        }
+
+    prompt = PLAN_PROMPT_TEMPLATE.format(
+        user_input=user_input,
+        instruction_blocks=build_instruction_blocks(rows),
+        domain_hints=build_instruction_domain_hints(),
+    )
     return {
         "instructions": rows,
         "domains": domains,
+        "messages": [
+            _build_user_input_message(
+                prompt,
+                id=_framework_id_from_messages(messages),
+                input_type="agent",
+            )
+        ],
     }
 
 
+def _latest_agent_human_message(
+    messages: list[BaseMessage],
+) -> HumanMessage | None:
+    """取最近一条 input_type=agent 的用户消息。"""
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage) and _message_fields(msg)["input_type"] == "agent":
+            return msg
+    return None
+
+
 def plan_node(state: GraphState) -> dict:
-    """规划节点：读取 instructions / domains，输出 plan；必要时回流 instruction。"""
+    """规划节点：用 instruction 写入的 HumanMessage(input_type=agent) 请求 LLM。"""
     messages = list(state.get("messages") or [])
     domains = list(state.get("domains") or [])
     rows = list(state.get("instructions") or [])
@@ -219,16 +250,21 @@ def plan_node(state: GraphState) -> dict:
         # instructions 为空时 plan_route 会结束，避免空查死循环
         return {"messages": [AIMessage(content=_dump_plan(plan))], "plan": plan}
 
-    prompt = PLAN_PROMPT_TEMPLATE.format(
-        user_input=user_input,
-        instruction_blocks=build_instruction_blocks(rows),
-        domain_hints=build_instruction_domain_hints(),
-    )
-    response = _get_llm().invoke(
-        [SystemMessage(content=message_text(messages[0])), HumanMessage(content=prompt)]
-        if messages and isinstance(messages[0], SystemMessage)
-        else [HumanMessage(content=prompt)]
-    )  # todo 后续这种结果返回尽量使用 with_structured_output 方式。
+    agent_human = _latest_agent_human_message(messages)
+    if agent_human is None:
+        plan = {
+            "action": "user_input",
+            "answer": "规划前置说明缺失，请补充更具体的需求",
+        }
+        return {"messages": [AIMessage(content=_dump_plan(plan))], "plan": plan}
+
+    llm_messages: list[BaseMessage] = []
+    if isinstance(messages[0], SystemMessage):
+        llm_messages.append(SystemMessage(content=message_text(messages[0])))
+    llm_messages.append(agent_human)
+
+    response = _get_llm().invoke(llm_messages)
+    # todo 后续这种结果返回尽量使用 with_structured_output 方式。
     raw = message_text(response)
     try:
         plan = parse_plan(raw)
