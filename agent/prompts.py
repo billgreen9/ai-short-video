@@ -98,11 +98,11 @@ PLAN_PROMPT_TEMPLATE = """请根据对话中已给出的用户请求与操作说
 3. 对如何完成用户请求尚且不明白，还缺少必要说明：
 {{"action":"instruction","list":["subtitle","short"],"help":false}}
 
-4. 输出给后端详细的 plan 计划，按执行先后返回；order 越小越先执行，order 相同可并发：
-{{"action":"plan","plans":[{{"en_name":"xx","order":1}}]}}
+4. 输出给后端详细的 plan 计划（depends_on 为依赖的前置 en_name 列表，可为空）：
+{{"action":"plan","plans":[{{"en_name":"xx","depends_on":["yy","zz"]}},{{"en_name":"yy","depends_on":[]}}]}}
 
-5. 已经将规划上的所有方法变更为原子方法，可以执行：
-{{"action":"can_execute","msg":"所有方法已经是原子方法了，可以执行了","plans":[{{"en_name":"xx","order":1}}]}}
+5. 已经将规划上的所有方法变更为原子方法，可以执行（执行顺序由 depends_on 依赖关系决定）：
+{{"action":"can_execute","msg":"所有方法已经是原子方法了，可以执行了","plans":[{{"en_name":"xx","depends_on":[]}}]}}
 
 instruction.list 当前支持的值：
 {domain_hints}
@@ -112,15 +112,10 @@ instruction.list 当前支持的值：
 2. 仅输出 JSON 本身。
 """.strip()
 
-# plan 自检回流时追加的确认话术. toDo 后续可以将文档中的所有容器技能skill改为大写字母开头
-PLAN_ATOMIC_CONFIRM_PROMPT = (
-    """请确认是否每个节点都是function节点，是否存在环，
-    如果不是请拆分为原子节点，然后确认无环时返回。
-    plan节点是否原子可以通过接口 is_atomic_plan_node 方法判断，接口支持一次处理多个。
-    返回格式:
-    {"action":"can_execute",
-				"msg":"所有节点已经时原子节点了,plans里面存放执行先后顺序。order越小越优先。",
-				"plans":[{"en_name":"xx","order":1}..]
-	}
-    """
-)
+# plan 自检回流时追加的确认话术。todo：后续可将文档中的容器技能改为大写字母开头
+PLAN_ATOMIC_CONFIRM_PROMPT = """请确认是否每个节点都是 function 节点，是否存在环；
+如果不是请拆分为原子节点，然后确认无环时返回。
+plan 节点是否原子可以通过接口 is_atomic_plan_node 判断，接口支持一次处理多个。
+返回格式（执行顺序由 depends_on 依赖关系决定）：
+{"action":"can_execute","msg":"所有节点已经是原子节点了，plans 里面存放执行依赖。","plans":[{"en_name":"xx","depends_on":[]}]}
+"""

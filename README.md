@@ -93,7 +93,7 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
   "thread_id": "e2e-001",
   "status": "done",
   "interrupt": null,
-  "action": {"action": "can_execute", "msg": "...", "plans": [{"en_name": "auto_generate_subtitle", "order": 1}]}
+  "action": {"action": "can_execute", "msg": "...", "plans": [{"en_name": "auto_generate_subtitle", "depends_on": []}]}
 }
 ```
 
@@ -117,7 +117,7 @@ GET /agent/resume?thread_id=e2e-001&user_input=audio_id=10086，去掉开头5秒
 | `user_input` | 需用户补充，`answner` 为指导话术 | → `human_input` 挂起，resume 后回 `plan` |
 | `param` | 缺少执行参数，`msg` 说明缺参 | → `human_input` 挂起，resume 后回 `plan` |
 | `instruction` | 继续加载说明，`list` 为 domain，`help` 默认 false | → `instruction` |
-| `plan` | 详细执行计划 `plans[{en_name,order}]` | 追加确认话术后自环 `plan` |
+| `plan` | 详细执行计划 `plans[{en_name,depends_on}]` | 追加确认话术后自环 `plan` |
 | `can_execute` | 已拆成原子方法，可执行 | → `before_execute` → `execute` → END |
 | `end` | 循环次数超 `plan_enter_max` 的强制结束（仅守卫产生，LLM 不返回） | END |
 
