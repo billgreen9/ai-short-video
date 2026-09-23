@@ -1,12 +1,13 @@
-"""LangGraph 智能体：意图路由 + 说明加载 + 规划。
+"""LangGraph 智能体：意图路由 + 说明加载 + 规划 + 执行前/执行。
 
 主路径：
     START --> intent --> instruction --(+ instruction_route)--> plan
                               ^                                  |
                               |                                  |
-                              +---- plan_route (action=instruction)
-                              |
-                              +---- instruction_route (非 intent 进入时回 prev_node)
+                              +---- plan_route (需继续加载说明)
+                                                                     |
+                                                                     v
+                                                          before_execute --> execute --> END
 
 instruction_route：
     - prev_node == "intent" -> plan
@@ -14,13 +15,15 @@ instruction_route：
 
 plan_route：
     - action.action == "instruction" 且 instructions/domains 非空 -> instruction
-    - 其余 -> END
+    - 其余 -> before_execute
 
 各节点职责：
     - intent：写入 intents / domains，prev_node=intent
     - instruction：只按 domains 加载说明到 HumanMessage(input_type=agent)；不改 prev_node
     - plan：首次用 PLAN_PROMPT_TEMPLATE 请求；之后用「请继续尝试规划」；
       写入 action；action=instruction 时更新 domains 并回流 instruction
+    - before_execute：执行前处理（占位）
+    - execute：执行（占位）
 
 启动 messages：
     [SystemMessage(outline), HumanMessage(用户正文, additional_kwargs={id})]
@@ -338,15 +341,25 @@ def plan_node(state: GraphState) -> dict:
 
 
 def plan_route(state: GraphState) -> str:
-    """state.action.action == instruction 且仍有可加载内容时，回流 instruction。"""
+    """需继续加载说明时回流 instruction，否则进入 before_execute。"""
     action = state.get("action") or {}
-    if action.get("action") != "instruction":
-        return END
-    if not (state.get("instructions") or []):
-        return END
-    if not (state.get("domains") or []):
-        return END
-    return "instruction"
+    if (
+        action.get("action") == "instruction"
+        and (state.get("instructions") or [])
+        and (state.get("domains") or [])
+    ):
+        return "instruction"
+    return "before_execute"
+
+
+def before_execute_node(state: GraphState) -> dict:
+    """执行前处理（占位，后续可挂校验 / 参数准备等）。"""
+    return {"prev_node": "before_execute"}
+
+
+def execute_node(state: GraphState) -> dict:
+    """执行节点（占位，后续可挂工具调用 / 工作流执行等）。"""
+    return {"prev_node": "execute"}
 
 
 def build_graph():
@@ -355,6 +368,8 @@ def build_graph():
     graph.add_node("intent", intent_node)
     graph.add_node("instruction", instruction_node)
     graph.add_node("plan", plan_node)
+    graph.add_node("before_execute", before_execute_node)
+    graph.add_node("execute", execute_node)
     graph.add_edge(START, "intent")
     graph.add_edge("intent", "instruction")
     graph.add_conditional_edges(
@@ -369,9 +384,11 @@ def build_graph():
         plan_route,
         {
             "instruction": "instruction",
-            END: END,
+            "before_execute": "before_execute",
         },
     )
+    graph.add_edge("before_execute", "execute")
+    graph.add_edge("execute", END)
     return graph.compile()
 
 
