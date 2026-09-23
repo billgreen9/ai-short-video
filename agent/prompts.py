@@ -43,11 +43,15 @@ def build_instruction_blocks(rows: list[dict[str, Any]]) -> str:
         title = row.get("title") or ""
         domain = row.get("domain") or ""
         text = row.get("text") or ""
+        type_ = row.get("type") or ""
+        en_name = row.get("en_name") or ""
         blocks.append(
             "\n".join(
                 [
                     f"--------{title}操作说明start------",
                     f"domain:{domain}",
+                    f"type:{type_}",
+                    f"en_name:{en_name}",
                     f"正文:{text}",
                     f"--------{title}操作说明end-------",
                 ]

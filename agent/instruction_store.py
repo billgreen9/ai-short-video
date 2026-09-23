@@ -16,7 +16,7 @@ def fetch_instructions(domains: list[str]) -> list[dict[str, Any]]:
         raise RuntimeError("未配置 POSTGRES_DSN，无法查询 instruction 表。")
 
     sql = """
-        SELECT title, domain, "text"
+        SELECT title, domain, "text", type, en_name
         FROM instruction
         WHERE status = 1
           AND domain = ANY(%s)
@@ -27,8 +27,14 @@ def fetch_instructions(domains: list[str]) -> list[dict[str, Any]]:
             cur.execute(sql, (domains,))
             rows = cur.fetchall()
     return [
-        {"title": title, "domain": domain, "text": text}
-        for title, domain, text in rows
+        {
+            "title": title,
+            "domain": domain,
+            "text": text,
+            "type": type_,
+            "en_name": en_name,
+        }
+        for title, domain, text, type_, en_name in rows
     ]
 
 
