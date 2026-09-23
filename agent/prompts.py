@@ -112,8 +112,15 @@ instruction.list 当前支持的值：
 2. 仅输出 JSON 本身。
 """.strip()
 
-# plan 自检回流时追加的确认话术
+# plan 自检回流时追加的确认话术. toDo 后续可以将文档中的所有容器技能skill改为大写字母开头
 PLAN_ATOMIC_CONFIRM_PROMPT = (
-    "请确认是否每个节点都是function节点，是否存在环，"
-    "如果不是请拆分为原子节点，然后确认无环时返回。"
+    """请确认是否每个节点都是function节点，是否存在环，
+    如果不是请拆分为原子节点，然后确认无环时返回。
+    plan节点是否原子可以通过接口 is_atomic_plan_node 方法判断，接口支持一次处理多个。
+    返回格式:
+    {"action":"can_execute",
+				"msg":"所有节点已经时原子节点了,plans里面存放执行先后顺序。order越小越优先。",
+				"plans":[{"en_name":"xx","order":1}..]
+	}
+    """
 )
