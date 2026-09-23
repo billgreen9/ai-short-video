@@ -1,7 +1,7 @@
 """智能体 HTTP 接口：通过 FastAPI 暴露 LangGraph agent。
 
 num / degree_threshold 从 config.json 读取，不接受请求参数。
-plan 优先取自 GraphState.plan。
+action 取自 GraphState.action。
 """
 from __future__ import annotations
 
@@ -18,9 +18,9 @@ agent_router = APIRouter(prefix="/agent", tags=["agent"])
 class AgentRouteResponse(BaseModel):
     """智能体规划响应。"""
 
-    plan: Optional[dict[str, Any]] = Field(
+    action: Optional[dict[str, Any]] = Field(
         default=None,
-        description='规划结果，如 {"action":"user_input","answer":"..."} '
+        description='动作结果，如 {"action":"user_input","answer":"..."} '
         '或 {"action":"instruction","list":["subtitle"]}',
     )
 
@@ -48,5 +48,5 @@ def start(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"智能体调用失败: {e}")
 
-    plan = result.get("plan") or None
-    return AgentRouteResponse(plan=plan if plan else None)
+    action = result.get("action") or None
+    return AgentRouteResponse(action=action if action else None)

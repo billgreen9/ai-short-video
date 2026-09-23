@@ -1,17 +1,29 @@
-"""LangGraph 智能体：路由 + 加载说明 + 规划。
+"""LangGraph 智能体：意图路由 + 说明加载 + 规划。
 
-图结构：
-    START --> intent --> instruction --> plan
-                              ^                  |
-                              |                  |
-                              +-- action=instruction（且仍有可加载说明）
+主路径：
+    START --> intent --> instruction --(+ instruction_route)--> plan
+                              ^                                  |
+                              |                                  |
+                              +---- plan_route (action=instruction)
                               |
-                              +--> END（user_input / 无说明可加载等）
+                              +---- instruction_route (非 intent 进入时回 prev_node)
 
-    单独设计 intent 是为了以后的预留召回设计，防止路由膨胀，必须要借助于“关键词+语义”检索召回
+instruction_route：
+    - prev_node == "intent" -> plan
+    - 其他 -> prev_node（通常为 plan）
 
-- instruction：按 domains 查表，把规划说明以 HumanMessage(input_type=agent) 写入 messages
-- plan：读取该 HumanMessage 请求 LLM，回复追加为 AIMessage
+plan_route：
+    - action.action == "instruction" 且 instructions/domains 非空 -> instruction
+    - 其余 -> END
+
+各节点职责：
+    - intent：写入 intents / domains，prev_node=intent
+    - instruction：只按 domains 加载说明到 HumanMessage(input_type=agent)；不改 prev_node
+    - plan：首次用 PLAN_PROMPT_TEMPLATE 请求；之后用「请继续尝试规划」；
+      写入 action；action=instruction 时更新 domains 并回流 instruction
+
+启动 messages：
+    [SystemMessage(outline), HumanMessage(用户正文, additional_kwargs={id})]
 """
 from __future__ import annotations
 
@@ -38,6 +50,7 @@ from config import settings
 
 
 _llm: Optional[ChatOpenAI] = None
+_CONTINUE_PLAN_PROMPT = "请继续尝试规划"
 
 
 def _get_llm() -> ChatOpenAI:
@@ -63,15 +76,17 @@ class GraphState(TypedDict):
     # intent 节点
     intents: list[dict[str, Any]]  # [{"intent": "...", "degree": 0.9}, ...]
 
-    # intent 筛选结果，或 plan(action=instruction).list，供 instruction 节点使用
+    # domains 仅由上游写入：intent（命中意图）或 plan（action=instruction 的 list）
     domains: list[str]
 
-    # instruction 节点
+    # instruction 节点查表结果
     instructions: list[dict[str, Any]]  # [{title, domain, text, type, en_name}, ...]
 
-    # plan 节点
-    plan: dict[str, Any]  # {"action":"user_input","answer":"..."} 或 {"action":"instruction","list":[...]}
+    # plan 节点输出（动作结果）
+    action: dict[str, Any]  # {"action":"user_input","answer":"..."} 或 {"action":"instruction","list":[...]}
     prev_node: str
+    # 是否已用 PLAN_PROMPT_TEMPLATE 请求过规划
+    plan_prompt_used: bool
 
 
 def build_initial_messages(
@@ -101,12 +116,14 @@ def build_initial_state(
         "intents": [],
         "domains": [],
         "instructions": [],
-        "plan": {},
+        "action": {},
+        "prev_node": "",
+        "plan_prompt_used": False,
     }
 
 
 def intent_node(state: GraphState) -> dict:
-    """路由节点：路由提示词只参与本次调用；命中 domain 写入状态后进入 instruction。"""
+    """路由节点：解析意图，把命中的 domains 写入状态，交给 instruction 加载。"""
     stage_text = ROUTE_PROMPT_TEMPLATE.format(
         intents_block=build_intents_block(),
         num=agent_config.num,
@@ -130,7 +147,7 @@ def intent_node(state: GraphState) -> dict:
         "messages": [response],
         "intents": intents,
         "domains": domains,
-        "pre_node":"intent"
+        "prev_node": "intent",
     }
 
 
@@ -179,39 +196,36 @@ def _dump_plan(plan: dict[str, Any]) -> str:
 
 
 def instruction_node(state: GraphState) -> dict:
-    """按 state.domains 查 instruction，写入状态，并以 HumanMessage(input_type=agent) 追加到 messages。"""
-    messages = list(state.get("messages") or [])
-    user_input = _user_input_from_messages(messages)
-    if not user_input:
-        return {"instructions": []}
-
+    """只根据上游 domains 加载说明消息；不修改 prev_node（供 instruction_route 判断来源）。"""
     domains = [d for d in (state.get("domains") or []) if d]
     if not domains:
         return {"instructions": []}
 
     rows = fetch_instructions(domains)
     if not rows:
-        return {
-            "instructions": [],
-            "domains": domains,
-        }
+        return {"instructions": []}
 
-    prompt = PLAN_PROMPT_TEMPLATE.format(
-        user_input=user_input,
-        instruction_blocks=build_instruction_blocks(rows),
-        domain_hints=build_instruction_domain_hints(),
-    )
+    messages = list(state.get("messages") or [])
     return {
         "instructions": rows,
-        "domains": domains,
         "messages": [
             _build_user_input_message(
-                prompt,
+                build_instruction_blocks(rows),
                 id=_framework_id_from_messages(messages),
                 input_type="agent",
             )
         ],
     }
+
+
+def instruction_route(state: GraphState) -> str:
+    """intent 进入 -> plan；其它来源回 prev_node。"""
+    prev = state.get("prev_node") or ""
+    if prev == "intent":
+        return "plan"
+    if prev and prev != "instruction":
+        return prev
+    return "plan"
 
 
 def _latest_agent_human_message(
@@ -225,43 +239,67 @@ def _latest_agent_human_message(
 
 
 def plan_node(state: GraphState) -> dict:
-    """规划节点：用 instruction 写入的 HumanMessage(input_type=agent) 请求 LLM。"""
+    """规划节点：首次用 PLAN_PROMPT_TEMPLATE，之后用「请继续尝试规划」。"""
     messages = list(state.get("messages") or [])
     domains = list(state.get("domains") or [])
     rows = list(state.get("instructions") or [])
     user_input = _user_input_from_messages(messages)
+    plan_prompt_used = bool(state.get("plan_prompt_used"))
 
     if not user_input or not messages:
         plan = {
             "action": "user_input",
             "answer": "用户输入信息不全，无法进行规划，请补充",
         }
-        return {"messages": [AIMessage(content=_dump_plan(plan))], "plan": plan}
+        return {
+            "messages": [AIMessage(content=_dump_plan(plan))],
+            "action": plan,
+            "prev_node": "plan",
+        }
 
     if not domains:
         plan = {
             "action": "user_input",
             "answer": "未匹配到足够置信度的操作，请补充更具体的需求",
         }
-        return {"messages": [AIMessage(content=_dump_plan(plan))], "plan": plan}
+        return {
+            "messages": [AIMessage(content=_dump_plan(plan))],
+            "action": plan,
+            "prev_node": "plan",
+        }
 
     if not rows:
         plan = {"action": "instruction", "list": domains}
-        # instructions 为空时 plan_route 会结束，避免空查死循环
-        return {"messages": [AIMessage(content=_dump_plan(plan))], "plan": plan}
-
-    agent_human = _latest_agent_human_message(messages)
-    if agent_human is None:
-        plan = {
-            "action": "user_input",
-            "answer": "规划前置说明缺失，请补充更具体的需求",
+        return {
+            "messages": [AIMessage(content=_dump_plan(plan))],
+            "action": plan,
+            "prev_node": "plan",
         }
-        return {"messages": [AIMessage(content=_dump_plan(plan))], "plan": plan}
+
+    if not plan_prompt_used:
+        request_text = PLAN_PROMPT_TEMPLATE.format(
+            user_input=user_input,
+            instruction_blocks=build_instruction_blocks(rows),
+            domain_hints=build_instruction_domain_hints(),
+        )
+    else:
+        request_text = _CONTINUE_PLAN_PROMPT
+
+    request_msg = _build_user_input_message(
+        request_text,
+        id=_framework_id_from_messages(messages),
+        input_type="agent",
+    )
 
     llm_messages: list[BaseMessage] = []
     if isinstance(messages[0], SystemMessage):
         llm_messages.append(SystemMessage(content=message_text(messages[0])))
-    llm_messages.append(agent_human)
+    # 继续规划时带上最近一次 instruction 加载的说明消息
+    if plan_prompt_used:
+        loaded = _latest_agent_human_message(messages)
+        if loaded is not None:
+            llm_messages.append(loaded)
+    llm_messages.append(request_msg)
 
     response = _get_llm().invoke(llm_messages)
     # todo 后续这种结果返回尽量使用 with_structured_output 方式。
@@ -275,6 +313,7 @@ def plan_node(state: GraphState) -> dict:
         }
         return {
             "messages": [
+                request_msg,
                 AIMessage(content=raw),
                 _build_user_input_message(
                     plan["answer"],
@@ -282,25 +321,27 @@ def plan_node(state: GraphState) -> dict:
                     input_type="agent",
                 ),
             ],
-            "plan": plan,
+            "action": plan,
+            "prev_node": "plan",
+            "plan_prompt_used": True,
         }
 
     updates: dict[str, Any] = {
-        "messages": [AIMessage(content=raw)],
-        "plan": plan,
+        "messages": [request_msg, AIMessage(content=raw)],
+        "action": plan,
+        "prev_node": "plan",
+        "plan_prompt_used": True,
     }
-    # 需要继续加载说明时，把 list 写回 domains，供 instruction 节点使用
     if plan.get("action") == "instruction":
         updates["domains"] = [str(x) for x in (plan.get("list") or []) if str(x)]
     return updates
 
 
 def plan_route(state: GraphState) -> str:
-    """plan 返回 action=instruction 且仍有可加载内容时，回流 instruction。"""
-    plan = state.get("plan") or {}
-    if plan.get("action") != "instruction":
+    """state.action.action == instruction 且仍有可加载内容时，回流 instruction。"""
+    action = state.get("action") or {}
+    if action.get("action") != "instruction":
         return END
-    # 上次未查到说明：直接结束，把 instruction list 交给调用方
     if not (state.get("instructions") or []):
         return END
     if not (state.get("domains") or []):
@@ -316,7 +357,13 @@ def build_graph():
     graph.add_node("plan", plan_node)
     graph.add_edge(START, "intent")
     graph.add_edge("intent", "instruction")
-    graph.add_edge("instruction", "plan")
+    graph.add_conditional_edges(
+        "instruction",
+        instruction_route,
+        {
+            "plan": "plan",
+        },
+    )
     graph.add_conditional_edges(
         "plan",
         plan_route,
